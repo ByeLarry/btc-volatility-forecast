@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import pickle
 import random
 from pathlib import Path
 from typing import Any, Iterator
@@ -40,7 +41,7 @@ def load_config(config_path: str | Path) -> tuple[dict[str, Any], Path]:
 
     if not path.exists():
         raise FileNotFoundError(
-            f"Файл конфигурации не найден: {path}. Поместите config.json рядом с main.ipynb и укажите параметры эксперимента."
+            f"Файл конфигурации не найден: {path}. Поместите config.json рядом с main.py и укажите параметры эксперимента."
         )
 
     with path.open("r", encoding="utf-8") as file:
@@ -262,12 +263,12 @@ def build_daily_dataset(config: dict[str, Any], project_root: Path) -> pd.DataFr
                 dropped,
             )
 
-        output_columns = ["date_utc", "realized_variance", "realized_volatility", *features]
+        output_columns = ["date_utc", "realized_volatility", *features]
         validation_features = features
     else:
         LOGGER.info("В конфигурации выбран только базовый набор признаков: сетевые признаки не загружаются.")
         merged = daily.copy()
-        output_columns = ["date_utc", "realized_variance", "realized_volatility"]
+        output_columns = ["date_utc", "realized_volatility"]
         validation_features = []
 
     merged = merged[output_columns].sort_values("date_utc").reset_index(drop=True)
@@ -280,8 +281,13 @@ def build_daily_dataset(config: dict[str, Any], project_root: Path) -> pd.DataFr
     return merged
 
 def validate_daily_targets(df: pd.DataFrame) -> None:
-    """Проверяет корректность рассчитанных realized_variance и realized_volatility."""
-    for column in ["realized_variance", "realized_volatility"]:
+    """Проверяет корректность целевых колонок с реализованной волатильностью."""
+    target_columns = ["realized_volatility"]
+
+    if "realized_variance" in df.columns:
+        target_columns.insert(0, "realized_variance")
+
+    for column in target_columns:
         values = pd.to_numeric(df[column], errors="coerce")
 
         if values.isna().any():
@@ -301,7 +307,7 @@ def validate_daily_targets(df: pd.DataFrame) -> None:
 
 def validate_daily_dataset(df: pd.DataFrame, network_features: list[str]) -> None:
     """Проверяет итоговый суточный набор данных перед обучением моделей."""
-    required = ["date_utc", "realized_variance", "realized_volatility", *network_features]
+    required = ["date_utc", "realized_volatility", *network_features]
     missing = [column for column in required if column not in df.columns]
 
     if missing:
@@ -313,7 +319,7 @@ def validate_daily_dataset(df: pd.DataFrame, network_features: list[str]) -> Non
         missing_counts = df[network_features].isna().sum().to_dict()
         raise ValueError(f"В сетевых признаках итогового набора остались пропуски: {missing_counts}")
 
-    numeric = df[["realized_variance", "realized_volatility", *network_features]].to_numpy(dtype=float)
+    numeric = df[["realized_volatility", *network_features]].to_numpy(dtype=float)
 
     if not np.isfinite(numeric).all():
         raise ValueError("Итоговый суточный набор содержит NaN или бесконечные значения.")
@@ -327,7 +333,6 @@ def add_log_features(df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     network_features = list(NETWORK_FEATURES) if uses_extended_feature_set(config) else []
     result = df.copy().sort_values("date_utc").reset_index(drop=True)
     result["realized_volatility"] = pd.to_numeric(result["realized_volatility"], errors="coerce")
-    result["realized_variance"] = pd.to_numeric(result["realized_variance"], errors="coerce")
     result["log_realized_volatility"] = np.log(result["realized_volatility"].clip(lower=0.0) + epsilon)
 
     for feature in network_features:
@@ -375,6 +380,19 @@ def scale_features_for_fold(
     scaler_name: str,
 ) -> np.ndarray:
     """Масштабирует признаки, обучая преобразователь только на обучающем интервале."""
+    scaled, _ = scale_features_for_window(df, feature_columns, train_start, train_end, scaler_name)
+
+    return scaled
+
+
+def scale_features_for_window(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+    train_start: int,
+    train_end: int,
+    scaler_name: str,
+) -> tuple[np.ndarray, StandardScaler | MinMaxScaler]:
+    """Масштабирует признаки и возвращает обученный преобразователь."""
     values = df[feature_columns].to_numpy(dtype=np.float64)
 
     if not np.isfinite(values).all():
@@ -387,7 +405,7 @@ def scale_features_for_fold(
     if not np.isfinite(scaled).all():
         raise ValueError("После масштабирования признаков получены некорректные значения.")
 
-    return scaled.astype(np.float32)
+    return scaled.astype(np.float32), scaler
 
 
 def create_scaler(name: str) -> StandardScaler | MinMaxScaler:
@@ -681,7 +699,6 @@ def run_experiments(
                     test_start=test_start,
                     test_end=test_end,
                     config=config,
-                    results_dir=result_paths["base"],
                 )
                 predictions_rows.extend(fold_predictions)
                 metrics_rows.append(fold_metrics)
@@ -709,7 +726,6 @@ def run_single_fold(
     test_start: int,
     test_end: int,
     config: dict[str, Any],
-    results_dir: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Обучает одну модель на одном шаге проверки и возвращает прогнозы с метриками."""
     experiment_config = config["experiment"]
@@ -766,19 +782,15 @@ def run_single_fold(
     )
     y_pred_log = train_and_predict(
         model_name=model_name,
-        feature_set=feature_set,
         fold=fold,
         x_train=x_train,
         y_train=y_train,
         x_test=x_test,
         config=config,
-        results_dir=results_dir,
     )
     epsilon = float(experiment_config["epsilon"])
     y_pred_sigma = inverse_log_volatility(y_pred_log, epsilon)
     y_true_sigma = data["realized_volatility"].to_numpy(dtype=np.float64)[target_indices]
-    y_true_variance = data["realized_variance"].to_numpy(dtype=np.float64)[target_indices]
-    y_pred_variance = np.square(y_pred_sigma)
     metrics = calculate_metrics(y_true_sigma, y_pred_sigma, epsilon)
     metrics_row = {
         "fold": fold,
@@ -797,8 +809,6 @@ def run_single_fold(
         y_pred_log=y_pred_log,
         y_true_sigma=y_true_sigma,
         y_pred_sigma=y_pred_sigma,
-        y_true_variance=y_true_variance,
-        y_pred_variance=y_pred_variance,
     )
 
     return prediction_rows, metrics_row
@@ -806,20 +816,37 @@ def run_single_fold(
 
 def train_and_predict(
     model_name: str,
-    feature_set: str,
     fold: int,
     x_train: np.ndarray,
     y_train: np.ndarray,
     x_test: np.ndarray,
     config: dict[str, Any],
-    results_dir: Path,
 ) -> np.ndarray:
     """Создает новую модель для шага проверки, обучает ее и возвращает прогнозы в логарифмической шкале."""
     seed = int(config["experiment"]["random_seed"]) + fold
+    model = fit_model(model_name, x_train, y_train, config, seed)
+    training_config = config["training"]
+    predictions = model.predict(
+        x_test,
+        batch_size=int(training_config["batch_size"]),
+        verbose=0,
+    ).reshape(-1)
+
+    return predictions.astype(np.float64)
+
+
+def fit_model(
+    model_name: str,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    config: dict[str, Any],
+    seed: int,
+) -> keras.Model:
+    """Обучает модель с ранней остановкой и возвращает экземпляр Keras."""
     set_random_seed(seed)
     keras.backend.clear_session()
     model = build_model(model_name, tuple(x_train.shape[1:]), config)
-    callbacks = build_callbacks(config, model_name, feature_set, fold, results_dir)
+    callbacks = build_callbacks(config)
     training_config = config["training"]
     model.fit(
         x_train,
@@ -831,23 +858,12 @@ def train_and_predict(
         verbose=int(training_config["verbose"]),
         callbacks=callbacks,
     )
-    predictions = model.predict(
-        x_test,
-        batch_size=int(training_config["batch_size"]),
-        verbose=0,
-    ).reshape(-1)
 
-    return predictions.astype(np.float64)
+    return model
 
 
-def build_callbacks(
-    config: dict[str, Any],
-    model_name: str,
-    feature_set: str,
-    fold: int,
-    results_dir: Path,
-) -> list[Any]:
-    """Создает обработчики Keras для ранней остановки и сохранения модели."""
+def build_callbacks(config: dict[str, Any]) -> list[Any]:
+    """Создает обработчики Keras для ранней остановки."""
     callbacks: list[Any] = []
     training_config = config["training"]
     monitor = "val_loss" if float(training_config["validation_split"]) > 0 else "loss"
@@ -858,18 +874,6 @@ def build_callbacks(
                 monitor=monitor,
                 patience=int(training_config["early_stopping_patience"]),
                 restore_best_weights=True,
-            )
-        )
-
-    if config["saving"]["save_models"]:
-        models_dir = results_dir / "models"
-        models_dir.mkdir(parents=True, exist_ok=True)
-        model_path = models_dir / f"{model_name}_{feature_set}_fold_{fold}.keras"
-        callbacks.append(
-            keras.callbacks.ModelCheckpoint(
-                filepath=str(model_path),
-                monitor=monitor,
-                save_best_only=True,
             )
         )
 
@@ -886,8 +890,6 @@ def build_prediction_rows(
     y_pred_log: np.ndarray,
     y_true_sigma: np.ndarray,
     y_pred_sigma: np.ndarray,
-    y_true_variance: np.ndarray,
-    y_pred_variance: np.ndarray,
 ) -> list[dict[str, Any]]:
     """Формирует строки таблицы прогнозов для одного шага проверки."""
     rows: list[dict[str, Any]] = []
@@ -904,8 +906,6 @@ def build_prediction_rows(
                 "y_pred_log": float(y_pred_log[position]),
                 "y_true_sigma": float(y_true_sigma[position]),
                 "y_pred_sigma": float(y_pred_sigma[position]),
-                "y_true_variance": float(y_true_variance[position]),
-                "y_pred_variance": float(y_pred_variance[position]),
             }
         )
 
@@ -974,6 +974,263 @@ def save_results(
         LOGGER.info("Сводка метрик сохранена в %s.", summary_path)
 
 
+def select_best_configuration(metrics_summary: pd.DataFrame, config: dict[str, Any]) -> tuple[str, str]:
+    """Выбирает лучшую модель и набор признаков по основной метрике."""
+    if metrics_summary.empty:
+        raise ValueError("Нельзя выбрать лучшую конфигурацию: сводная таблица метрик пуста.")
+
+    selection_metric = str(
+        config["experiment"].get("selection_metric", config["saving"].get("selection_metric", "mae"))
+    ).strip()
+    base_metric = selection_metric[5:] if selection_metric.lower().startswith("mean_") else selection_metric
+    metric_column = selection_metric if selection_metric in metrics_summary.columns else f"mean_{base_metric.upper()}"
+
+    if metric_column not in metrics_summary.columns:
+        raise ValueError(f"В сводной таблице метрик нет колонки для выбора лучшей конфигурации: {metric_column}")
+
+    best_index = metrics_summary[metric_column].astype(float).idxmin()
+    best_row = metrics_summary.loc[best_index]
+    model_name = str(best_row["model_name"]).lower()
+    feature_set = str(best_row["feature_set"]).lower()
+    LOGGER.info(
+        "Выбрана итоговая конфигурация: %s + %s по минимальному %s.",
+        model_name.upper(),
+        feature_set,
+        metric_column,
+    )
+
+    return model_name, feature_set
+
+
+def train_final_model(
+    daily_df: pd.DataFrame,
+    config: dict[str, Any],
+    project_root: Path,
+    model_name: str,
+    feature_set: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Обучает итоговую модель на последнем обучающем окне и сохраняет артефакты."""
+    result_paths = create_result_dirs(config, project_root)
+    data = add_log_features(daily_df, config)
+    feature_columns = get_feature_columns(data, feature_set)
+    experiment_config = config["experiment"]
+    input_window = int(experiment_config["input_window"])
+    forecast_horizon = int(experiment_config["forecast_horizon"])
+    train_window = int(experiment_config["train_window"])
+    test_window = int(experiment_config["test_window"])
+    test_end = len(data)
+    test_start = test_end - test_window
+    train_end = test_start
+    train_start = train_end - train_window
+
+    if train_start < 0:
+        raise ValueError(
+            "Недостаточно суточных наблюдений для итогового train/test-разреза. "
+            f"Доступно: {len(data)}; требуется минимум: {train_window + test_window}."
+        )
+
+    scaled_features, scaler = scale_features_for_window(
+        df=data,
+        feature_columns=feature_columns,
+        train_start=train_start,
+        train_end=train_end,
+        scaler_name=experiment_config["scaler"],
+    )
+    y_log = data["log_realized_volatility"].to_numpy(dtype=np.float64)
+    x_train, y_train, _ = make_sequences(
+        features=scaled_features,
+        y_log=y_log,
+        target_start=train_start,
+        target_end=train_end,
+        input_window=input_window,
+        forecast_horizon=forecast_horizon,
+        model_name=model_name,
+        min_input_index=train_start,
+    )
+    x_test, y_test, target_indices = make_sequences(
+        features=scaled_features,
+        y_log=y_log,
+        target_start=test_start,
+        target_end=test_end,
+        input_window=input_window,
+        forecast_horizon=forecast_horizon,
+        model_name=model_name,
+        min_input_index=train_start,
+    )
+
+    if len(x_train) == 0:
+        raise ValueError("Для итоговой модели не сформировались обучающие последовательности.")
+
+    if len(x_test) == 0:
+        raise ValueError("Для итоговой модели не сформировались тестовые последовательности.")
+
+    LOGGER.info(
+        "Обучение итоговой модели %s, набор признаков «%s»: обучающих примеров %s, тестовых примеров %s.",
+        model_name.upper(),
+        feature_set,
+        len(x_train),
+        len(x_test),
+    )
+    model = fit_model(model_name, x_train, y_train, config, int(experiment_config["random_seed"]))
+    training_config = config["training"]
+    y_pred_log = model.predict(
+        x_test,
+        batch_size=int(training_config["batch_size"]),
+        verbose=0,
+    ).reshape(-1).astype(np.float64)
+    epsilon = float(experiment_config["epsilon"])
+    y_pred_sigma = inverse_log_volatility(y_pred_log, epsilon)
+    y_true_sigma = data["realized_volatility"].to_numpy(dtype=np.float64)[target_indices]
+    metrics = calculate_metrics(y_true_sigma, y_pred_sigma, epsilon)
+    final_predictions = pd.DataFrame(
+        build_final_prediction_rows(
+            data=data,
+            model_name=model_name,
+            feature_set=feature_set,
+            target_indices=target_indices,
+            y_true_log=y_test,
+            y_pred_log=y_pred_log,
+            y_true_sigma=y_true_sigma,
+            y_pred_sigma=y_pred_sigma,
+        )
+    )
+    final_metrics = pd.DataFrame(
+        [
+            {
+                "model_name": model_name.upper(),
+                "feature_set": feature_set,
+                **metrics,
+                "n_test": int(len(y_test)),
+                "final_train_start_date": format_date(data.loc[train_start, "date_utc"]),
+                "final_train_end_date": format_date(data.loc[train_end - 1, "date_utc"]),
+                "final_test_start_date": format_date(data.loc[test_start, "date_utc"]),
+                "final_test_end_date": format_date(data.loc[test_end - 1, "date_utc"]),
+            }
+        ]
+    )
+    metadata = {
+        "selected_model": model_name,
+        "selected_feature_set": feature_set,
+        "input_window": input_window,
+        "forecast_horizon": forecast_horizon,
+        "train_window": train_window,
+        "test_window": test_window,
+        "scaler": experiment_config["scaler"],
+        "epsilon": epsilon,
+        "feature_columns": feature_columns,
+        "target_column": "log_realized_volatility",
+        "final_train_start_date": format_date(data.loc[train_start, "date_utc"]),
+        "final_train_end_date": format_date(data.loc[train_end - 1, "date_utc"]),
+        "final_test_start_date": format_date(data.loc[test_start, "date_utc"]),
+        "final_test_end_date": format_date(data.loc[test_end - 1, "date_utc"]),
+        "final_metrics": metrics,
+    }
+    save_final_artifacts(
+        model=model,
+        scaler=scaler,
+        final_predictions=final_predictions,
+        final_metrics=final_metrics,
+        metadata=metadata,
+        config=config,
+        results_dir=result_paths["base"],
+    )
+
+    return final_predictions, final_metrics
+
+
+def build_final_prediction_rows(
+    data: pd.DataFrame,
+    model_name: str,
+    feature_set: str,
+    target_indices: np.ndarray,
+    y_true_log: np.ndarray,
+    y_pred_log: np.ndarray,
+    y_true_sigma: np.ndarray,
+    y_pred_sigma: np.ndarray,
+) -> list[dict[str, Any]]:
+    """Формирует строки итогового прогноза."""
+    rows: list[dict[str, Any]] = []
+
+    for position, target_index in enumerate(target_indices):
+        rows.append(
+            {
+                "model_name": model_name.upper(),
+                "feature_set": feature_set,
+                "target_date": format_date(data.loc[int(target_index), "date_utc"]),
+                "y_true_log": float(y_true_log[position]),
+                "y_pred_log": float(y_pred_log[position]),
+                "y_true_sigma": float(y_true_sigma[position]),
+                "y_pred_sigma": float(y_pred_sigma[position]),
+            }
+        )
+
+    return rows
+
+
+def save_final_artifacts(
+    model: keras.Model,
+    scaler: StandardScaler | MinMaxScaler,
+    final_predictions: pd.DataFrame,
+    final_metrics: pd.DataFrame,
+    metadata: dict[str, Any],
+    config: dict[str, Any],
+    results_dir: Path,
+) -> None:
+    """Сохраняет итоговые прогнозы, метрики, график и модельные артефакты."""
+    results_dir.mkdir(parents=True, exist_ok=True)
+    predictions_path = results_dir / "final_predictions.csv"
+    metrics_path = results_dir / "final_metrics.csv"
+    final_predictions.to_csv(predictions_path, index=False)
+    final_metrics.to_csv(metrics_path, index=False)
+    save_final_prediction_plot(final_predictions, results_dir / "final_prediction_plot.png")
+    LOGGER.info("Итоговые прогнозы сохранены в %s.", predictions_path)
+    LOGGER.info("Итоговые метрики сохранены в %s.", metrics_path)
+
+    if not config["saving"]["save_models"]:
+        return
+
+    model_path = results_dir / "final_model.keras"
+    scaler_path = results_dir / "final_scaler.pkl"
+    metadata_path = results_dir / "final_model_metadata.json"
+    model.save(model_path)
+
+    with scaler_path.open("wb") as file:
+        pickle.dump(scaler, file)
+
+    with metadata_path.open("w", encoding="utf-8") as file:
+        json.dump(metadata, file, ensure_ascii=False, indent=2)
+
+    LOGGER.info("Итоговая модель сохранена в %s.", model_path)
+    LOGGER.info("Итоговый scaler сохранен в %s.", scaler_path)
+    LOGGER.info("Метаданные итоговой модели сохранены в %s.", metadata_path)
+
+
+def save_final_prediction_plot(final_predictions: pd.DataFrame, path: Path) -> None:
+    """Сохраняет график фактической и прогнозной волатильности итоговой модели."""
+    if final_predictions.empty:
+        raise ValueError("Нельзя построить итоговый график: таблица прогнозов пуста.")
+
+    plot_data = final_predictions.copy()
+    plot_data["target_date"] = pd.to_datetime(plot_data["target_date"])
+    plot_data = plot_data.sort_values("target_date")
+    plt.figure(figsize=(12, 5))
+    plt.plot(plot_data["target_date"], plot_data["y_true_sigma"], label="Фактическая волатильность")
+    plt.plot(plot_data["target_date"], plot_data["y_pred_sigma"], label="Прогнозная волатильность")
+    plt.title("Итоговая модель: фактическая и прогнозная волатильность")
+    plt.xlabel("Дата")
+    plt.ylabel("Реализованная волатильность")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+    LOGGER.info("Итоговый график сохранен в %s.", path)
+
+
+def format_date(value: Any) -> str:
+    """Возвращает дату в формате ISO."""
+    return pd.Timestamp(value).date().isoformat()
+
+
 def create_result_dirs(config: dict[str, Any], project_root: Path) -> dict[str, Path]:
     """Создает директории для результатов эксперимента."""
     base = resolve_path(config["paths"]["results_dir"], project_root)
@@ -1034,21 +1291,36 @@ def set_random_seed(seed: int) -> None:
 
 CONFIG_FILE = globals().get("CONFIG_FILE", "config.json")
 
-PROJECT_ROOT = Path.cwd().resolve()
-CONFIG_PATH = PROJECT_ROOT / CONFIG_FILE
 
-if not CONFIG_PATH.exists():
-    raise FileNotFoundError(f"Файл конфигурации не найден: {CONFIG_PATH}")
+def main(config_file: str | Path = CONFIG_FILE) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Запускает полный пайплайн подготовки данных, rolling validation и итогового обучения."""
+    project_root = Path.cwd().resolve()
+    config_path = project_root / config_file
 
-config = load_config(CONFIG_PATH)[0]
-LOGGER.info("Конфигурация загружена из %s.", CONFIG_PATH)
-LOGGER.info("Активные наборы признаков: %s.", ", ".join(config["experiment"]["feature_sets"]))
-LOGGER.info("Корень проекта: %s.", PROJECT_ROOT)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Файл конфигурации не найден: {config_path}")
 
-daily_dataset = build_daily_dataset(config, PROJECT_ROOT)
-LOGGER.info("Сформирован суточный набор данных, строк: %s.", len(daily_dataset))
+    config, project_root = load_config(config_path)
+    LOGGER.info("Конфигурация загружена из %s.", config_path)
+    LOGGER.info("Активные наборы признаков: %s.", ", ".join(config["experiment"]["feature_sets"]))
+    LOGGER.info("Корень проекта: %s.", project_root)
 
-predictions, metrics_by_fold, metrics_summary = run_experiments(daily_dataset, config, PROJECT_ROOT)
+    daily_dataset = build_daily_dataset(config, project_root)
+    LOGGER.info("Сформирован суточный набор данных, строк: %s.", len(daily_dataset))
+    predictions, metrics_by_fold, metrics_summary = run_experiments(daily_dataset, config, project_root)
+    best_model_name, best_feature_set = select_best_configuration(metrics_summary, config)
+    final_predictions, final_metrics = train_final_model(
+        daily_df=daily_dataset,
+        config=config,
+        project_root=project_root,
+        model_name=best_model_name,
+        feature_set=best_feature_set,
+    )
 
+    return predictions, metrics_by_fold, metrics_summary, final_predictions, final_metrics
+
+
+if __name__ == "__main__":
+    main()
 
 
