@@ -3,7 +3,7 @@
     "market_5m_csv": "data/raw/btc_5m_ohlcv.csv",
     "network_daily_csv": "data/raw/btc_network_daily.csv",
     "daily_dataset_csv": "data/processed/daily_dataset.csv",
-    "results_dir": "results/results_53"
+    "results_dir": "results/results_51"
   },
   "experiment": {
     "input_window": 21,
