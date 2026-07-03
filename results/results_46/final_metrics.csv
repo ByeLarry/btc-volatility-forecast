@@ -1,2 +1,0 @@
-model_name,feature_set,MAE,RMSE,MAPE,n_test,final_train_start_date,final_train_end_date,final_test_start_date,final_test_end_date
-MLP,extended,0.0054954029009235085,0.006637930939166572,47.017988375486865,30,2024-08-23,2025-08-24,2025-08-25,2025-09-23

@@ -201,8 +201,11 @@ def calculate_daily_realized_volatility(market_df: pd.DataFrame) -> pd.DataFrame
     )
     aligned = market.reindex(grid)
     aligned["close"] = pd.to_numeric(aligned["close"], errors="coerce")
+    aligned["volume"] = pd.to_numeric(aligned["volume"], errors="coerce")
     aligned["date_utc"] = aligned.index.floor("D")
     original_points = aligned["close"].notna().groupby(aligned["date_utc"]).sum()
+    daily_volume = aligned["volume"].fillna(0.0).groupby(aligned["date_utc"]).sum()
+    unique_close_prices = aligned["close"].groupby(aligned["date_utc"]).nunique()
 
     if aligned.empty:
         raise ValueError("После выравнивания 5-минутной сетки не осталось цен закрытия.")
@@ -218,6 +221,8 @@ def calculate_daily_realized_volatility(market_df: pd.DataFrame) -> pd.DataFrame
         intraday_returns=("log_return", "count"),
     )
     daily["original_intraday_points"] = daily["date_utc"].map(original_points).fillna(0).astype(int)
+    daily["daily_volume"] = daily["date_utc"].map(daily_volume).fillna(0.0).astype(float)
+    daily["unique_close_prices"] = daily["date_utc"].map(unique_close_prices).fillna(0).astype(int)
     before = len(daily)
     daily = daily[
         (daily["original_intraday_points"] == EXPECTED_INTRADAY_POINTS)
@@ -233,6 +238,25 @@ def calculate_daily_realized_volatility(market_df: pd.DataFrame) -> pd.DataFrame
             "После исключения неполных суток не осталось наблюдений. "
             "Проверьте период данных или ожидаемое число 5-минутных интервалов в сутках."
         )
+
+    invalid_market_days = (
+        (daily["realized_variance"] <= 0.0)
+        | (
+            (daily["unique_close_prices"] <= 1)
+            & (daily["daily_volume"] <= 0.0)
+        )
+    )
+    invalid_count = int(invalid_market_days.sum())
+
+    if invalid_count:
+        LOGGER.info(
+            "Исключено UTC-суток с нулевой реализованной дисперсией или плоской ценой при нулевом объеме: %s.",
+            invalid_count,
+        )
+        daily = daily[~invalid_market_days].copy()
+
+    if daily.empty:
+        raise ValueError("После исключения нулевых или неинформативных UTC-суток не осталось наблюдений.")
 
     daily["realized_volatility"] = np.sqrt(daily["realized_variance"])
     daily = daily[["date_utc", "realized_variance", "realized_volatility"]]
