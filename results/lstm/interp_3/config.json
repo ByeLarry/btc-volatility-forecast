@@ -3,10 +3,10 @@
     "market_5m_csv": "data/raw/btc_5m_ohlcv.csv",
     "network_daily_csv": "data/raw/btc_network_daily.csv",
     "daily_dataset_csv": "data/processed/daily_dataset_interpolated.csv",
-    "results_dir": "results/lstm/interp_1"
+    "results_dir": "results/lstm/interp_3"
   },
   "experiment": {
-    "input_window": 14,
+    "input_window": 21,
     "forecast_horizon": 1,
     "train_window": 730,
     "test_window": 30,
@@ -19,12 +19,12 @@
     "selection_metric": "mean_MAE"
   },
   "training": {
-    "learning_rate": 0.000095,
+    "learning_rate": 0.00012,
     "batch_size": 32,
-    "epochs": 320,
+    "epochs": 300,
     "validation_split": 0.15,
     "early_stopping": true,
-    "early_stopping_patience": 28,
+    "early_stopping_patience": 26,
     "verbose": 0
   },
   "mlp": {
@@ -34,7 +34,7 @@
   },
   "lstm": {
     "units": [32],
-    "dropout": 0.36,
+    "dropout": 0.35,
     "recurrent_dropout": 0.02,
     "dense_units": [8],
     "activation": "relu"

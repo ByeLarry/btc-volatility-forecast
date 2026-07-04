@@ -2,8 +2,8 @@
   "paths": {
     "market_5m_csv": "data/raw/btc_5m_ohlcv.csv",
     "network_daily_csv": "data/raw/btc_network_daily.csv",
-    "daily_dataset_csv": "data/processed/daily_dataset_interpolated.csv",
-    "results_dir": "results/lstm/interp_1"
+    "daily_dataset_csv": "data/processed/daily_dataset.csv",
+    "results_dir": "results/lstm/results_4"
   },
   "experiment": {
     "input_window": 14,

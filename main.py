@@ -265,6 +265,36 @@ def calculate_daily_realized_volatility(market_df: pd.DataFrame) -> pd.DataFrame
     return daily
 
 
+def align_daily_calendar(
+    df: pd.DataFrame,
+    value_columns: list[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    interpolation_flag_column: str,
+) -> pd.DataFrame:
+    """Выравнивает суточные данные по полному UTC-календарю и интерполирует внутренние пропуски."""
+    calendar = pd.DataFrame(
+        {
+            "date_utc": pd.date_range(
+                start=start_date,
+                end=end_date,
+                freq="D",
+                tz="UTC",
+            )
+        }
+    )
+    aligned = calendar.merge(df[["date_utc", *value_columns]], on="date_utc", how="left")
+    aligned[interpolation_flag_column] = aligned[value_columns].isna().any(axis=1)
+
+    for column in value_columns:
+        aligned[column] = aligned[column].interpolate(
+            method="linear",
+            limit_area="inside",
+        )
+
+    return aligned
+
+
 def build_daily_dataset(config: dict[str, Any], project_root: Path) -> pd.DataFrame:
     """Формирует итоговый суточный набор данных и сохраняет его в data/processed."""
     LOGGER.info("Загрузка локальных 5-минутных рыночных данных BTC.")
@@ -272,26 +302,84 @@ def build_daily_dataset(config: dict[str, Any], project_root: Path) -> pd.DataFr
     LOGGER.info("Расчет дневной реализованной волатильности.")
     daily = calculate_daily_realized_volatility(market)
     features = list(NETWORK_FEATURES)
+    calendar_start = daily["date_utc"].min()
+    calendar_end = daily["date_utc"].max()
 
     if uses_extended_feature_set(config):
         LOGGER.info("Загрузка суточных сетевых признаков для расширенного набора.")
         network = load_network_data(config, project_root)
+        calendar_start = max(calendar_start, network["date_utc"].min())
+        calendar_end = min(calendar_end, network["date_utc"].max())
 
-        before = len(daily)
-        merged = daily.merge(network, on="date_utc", how="inner")
-        dropped = before - len(merged)
+        if calendar_start > calendar_end:
+            raise ValueError("Рыночные и сетевые данные не имеют общего диапазона дат.")
+
+        daily = align_daily_calendar(
+            df=daily,
+            value_columns=["realized_volatility"],
+            start_date=calendar_start,
+            end_date=calendar_end,
+            interpolation_flag_column="is_realized_volatility_interpolated",
+        )
+        network = align_daily_calendar(
+            df=network,
+            value_columns=features,
+            start_date=calendar_start,
+            end_date=calendar_end,
+            interpolation_flag_column="is_network_interpolated",
+        )
+        merged = daily.merge(network, on="date_utc", how="left")
+        before_drop = len(merged)
+        merged = merged.dropna(subset=["realized_volatility", *features]).copy()
+        dropped = before_drop - len(merged)
+        restored_volatility = int(merged["is_realized_volatility_interpolated"].sum())
+        restored_network = int(merged["is_network_interpolated"].sum())
+
+        if restored_volatility or restored_network:
+            LOGGER.info(
+                "Интерполированы пропуски в суточном календаре: волатильность=%s, сетевые признаки=%s.",
+                restored_volatility,
+                restored_network,
+            )
 
         if dropped:
             LOGGER.info(
-                "После согласования с сетевыми признаками исключено суток без сетевых данных: %s.",
+                "После интерполяции исключено граничных суток с невосстановленными пропусками: %s.",
                 dropped,
             )
 
-        output_columns = ["date_utc", "realized_volatility", *features]
+        output_columns = [
+            "date_utc",
+            "realized_volatility",
+            *features,
+        ]
         validation_features = features
     else:
         LOGGER.info("В конфигурации выбран только базовый набор признаков: сетевые признаки не загружаются.")
-        merged = daily.copy()
+        merged = align_daily_calendar(
+            df=daily,
+            value_columns=["realized_volatility"],
+            start_date=calendar_start,
+            end_date=calendar_end,
+            interpolation_flag_column="is_realized_volatility_interpolated",
+        )
+        before_drop = len(merged)
+        merged = merged.dropna(subset=["realized_volatility"]).copy()
+        dropped = before_drop - len(merged)
+        restored_volatility = int(merged["is_realized_volatility_interpolated"].sum())
+
+        if restored_volatility:
+            LOGGER.info(
+                "Интерполированы пропуски в суточном календаре: волатильность=%s.",
+                restored_volatility,
+            )
+
+        if dropped:
+            LOGGER.info(
+                "После интерполяции исключено граничных суток с невосстановленными пропусками: %s.",
+                dropped,
+            )
+
         output_columns = ["date_utc", "realized_volatility"]
         validation_features = []
 

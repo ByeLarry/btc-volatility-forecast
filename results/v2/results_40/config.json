@@ -2,8 +2,8 @@
   "paths": {
     "market_5m_csv": "data/raw/btc_5m_ohlcv.csv",
     "network_daily_csv": "data/raw/btc_network_daily.csv",
-    "daily_dataset_csv": "data/processed/daily_dataset_interpolated.csv",
-    "results_dir": "results/lstm/interp_1"
+    "daily_dataset_csv": "data/processed/daily_dataset.csv",
+    "results_dir": "results/v2/results_40"
   },
   "experiment": {
     "input_window": 14,
@@ -12,30 +12,25 @@
     "test_window": 30,
     "step_size": 90,
     "feature_sets": ["base", "extended"],
-    "models": ["lstm"],
+    "models": ["mlp", "lstm"],
     "scaler": "standard",
     "epsilon": 1e-8,
-    "random_seed": 764,
-    "selection_metric": "mean_MAE"
+    "random_seed": 764
   },
   "training": {
-    "learning_rate": 0.000095,
+    "learning_rate": 0.000115,
     "batch_size": 32,
-    "epochs": 320,
+    "epochs": 280,
     "validation_split": 0.15,
     "early_stopping": true,
-    "early_stopping_patience": 28,
+    "early_stopping_patience": 24,
     "verbose": 0
   },
-  "mlp": {
-    "hidden_units": [80, 40],
-    "dropout": 0.38,
-    "activation": "relu"
-  },
+  "mlp": { "hidden_units": [80, 40], "dropout": 0.38, "activation": "relu" },
   "lstm": {
-    "units": [32],
-    "dropout": 0.36,
-    "recurrent_dropout": 0.02,
+    "units": [24],
+    "dropout": 0.33,
+    "recurrent_dropout": 0.05,
     "dense_units": [8],
     "activation": "relu"
   },
