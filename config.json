@@ -2,7 +2,7 @@
   "paths": {
     "market_5m_csv": "data/raw/btc_5m_ohlcv.csv",
     "network_daily_csv": "data/raw/btc_network_daily.csv",
-    "daily_dataset_csv": "data/processed/daily_dataset_interpolated.csv",
+    "daily_dataset_csv": "data/processed/daily_datasetd.csv",
     "results_dir": "results/lstm/interp_1"
   },
   "experiment": {
@@ -16,7 +16,7 @@
     "scaler": "standard",
     "epsilon": 1e-8,
     "random_seed": 764,
-    "selection_metric": "mean_MAE"
+    "selection_metric": "rmse"
   },
   "training": {
     "learning_rate": 0.000095,

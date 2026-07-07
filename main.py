@@ -393,28 +393,31 @@ def build_daily_dataset(config: dict[str, Any], project_root: Path) -> pd.DataFr
     return merged
 
 def validate_daily_targets(df: pd.DataFrame) -> None:
-    """Проверяет корректность целевых колонок с реализованной волатильностью."""
-    target_columns = ["realized_volatility"]
+    """Проверяет корректность целевой колонки с реализованной волатильностью."""
+    column = "realized_volatility"
 
-    if "realized_variance" in df.columns:
-        target_columns.insert(0, "realized_variance")
+    if column not in df.columns:
+        raise ValueError(f"В таблице отсутствует обязательная колонка {column}.")
 
-    for column in target_columns:
-        values = pd.to_numeric(df[column], errors="coerce")
+    values = pd.to_numeric(df[column], errors="coerce")
 
-        if values.isna().any():
-            raise ValueError(f"В колонке {column} есть NaN.")
+    if values.isna().any():
+        raise ValueError(f"В колонке {column} есть NaN.")
 
-        if not np.isfinite(values.to_numpy()).all():
-            raise ValueError(f"В колонке {column} есть бесконечные значения.")
+    if not np.isfinite(values.to_numpy()).all():
+        raise ValueError(f"В колонке {column} есть бесконечные значения.")
 
-        if (values < 0).any():
-            raise ValueError(f"В колонке {column} есть отрицательные значения.")
+    if (values < 0).any():
+        raise ValueError(f"В колонке {column} есть отрицательные значения.")
 
-    zero_count = int((df["realized_volatility"] == 0).sum())
+    zero_count = int((values == 0).sum())
 
     if zero_count:
-        LOGGER.warning("Найдено нулевых значений реализованной волатильности: %s. При логарифмировании будет использована малая добавка из конфигурации.", zero_count)
+        LOGGER.warning(
+            "Найдено нулевых значений реализованной волатильности: %s. "
+            "При логарифмировании будет использована малая добавка из конфигурации.",
+            zero_count,
+        )
 
 
 def validate_daily_dataset(df: pd.DataFrame, network_features: list[str]) -> None:
