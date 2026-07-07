@@ -35,7 +35,7 @@
 
 ### Формирование итогового суточного набора данных
 
-<img width="121" height="792" alt="Формирование итогового суточного набора данных" src="https://github.com/user-attachments/assets/e334e93e-4ef5-4532-ad06-605029b99ac8" />
+<img width="121" height="872" alt="Формирование итогового суточного набора данных" src="https://github.com/user-attachments/assets/1e6aec63-143e-436d-a605-fac6513912ca" />
 
 ### Схема алгоритма подготовки данных и валидации модели
 
