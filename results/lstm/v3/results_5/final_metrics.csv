@@ -1,0 +1,2 @@
+model_name,feature_set,MAE,RMSE,MAPE,n_train,n_test,training_scope,final_train_start_date,final_train_end_date,final_test_start_date,final_test_end_date
+LSTM,extended,0.008195508837813966,0.010405244253162855,27.18264741865768,1620,30,all_except_final_test_window,2017-09-02,2022-02-28,2022-03-01,2022-03-30

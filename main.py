@@ -33,6 +33,96 @@ LOGGER = logging.getLogger("btc_volatility")
 NETWORK_FEATURES = ["unique_addresses", "transfer_volume_btc", "avg_fee_usd"]
 MARKET_FREQUENCY = "5min"
 EXPECTED_INTRADAY_POINTS = 288
+SUPPORTED_METRICS = ("MAE", "MSE", "RMSE", "MAPE", "QLIKE", "R2", "DA")
+SUMMARY_STATISTICS = ("mean", "std", "median")
+MAXIMIZED_METRICS = {"R2", "DA"}
+SUPPORTED_LOSSES = ("mse", "mae", "huber", "qlike")
+QLIKE_LOG_RATIO_LIMIT = 10.0
+
+
+def normalize_metric_names(metric_names: Any) -> list[str]:
+    """Проверяет и нормализует список метрик."""
+    if not isinstance(metric_names, list) or not metric_names:
+        raise ValueError("Параметр experiment.metrics должен быть непустым массивом названий метрик.")
+
+    if any(not isinstance(name, str) or not name.strip() for name in metric_names):
+        raise ValueError("Все элементы experiment.metrics должны быть непустыми строками.")
+
+    normalized = [name.strip().upper() for name in metric_names]
+    duplicates = sorted({name for name in normalized if normalized.count(name) > 1})
+    unknown = sorted(set(normalized) - set(SUPPORTED_METRICS))
+
+    if duplicates:
+        raise ValueError(f"В experiment.metrics указаны повторяющиеся метрики: {duplicates}")
+
+    if unknown:
+        raise ValueError(
+            f"В experiment.metrics указаны неподдерживаемые метрики: {unknown}. "
+            f"Допустимые значения: {list(SUPPORTED_METRICS)}"
+        )
+
+    return normalized
+
+
+def get_enabled_metrics(config: dict[str, Any]) -> list[str]:
+    """Возвращает включенные в конфигурации метрики."""
+    return normalize_metric_names(config["experiment"]["metrics"])
+
+
+def resolve_selection_metric(config: dict[str, Any]) -> tuple[str, str, str]:
+    """Проверяет метрику выбора модели и возвращает имя колонки сводки."""
+    enabled_metrics = get_enabled_metrics(config)
+    raw_value = config["experiment"].get("selection_metric", enabled_metrics[0])
+
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ValueError("Параметр experiment.selection_metric должен быть непустой строкой.")
+
+    selection_metric = raw_value.strip().lower()
+    statistic = "mean"
+    metric_name = selection_metric
+
+    if "_" in selection_metric:
+        statistic, metric_name = selection_metric.split("_", maxsplit=1)
+
+        if statistic not in SUMMARY_STATISTICS:
+            raise ValueError(
+                "Префикс experiment.selection_metric должен быть mean, median или std. "
+                "Также можно указать название метрики без префикса."
+            )
+
+    metric_name = metric_name.upper()
+
+    if metric_name not in SUPPORTED_METRICS:
+        raise ValueError(
+            f"В experiment.selection_metric указана неподдерживаемая метрика: {metric_name}. "
+            f"Допустимые значения: {list(SUPPORTED_METRICS)}"
+        )
+
+    if metric_name not in enabled_metrics:
+        raise ValueError(
+            f"Метрика выбора {metric_name} запрещена текущей конфигурацией: "
+            "добавьте ее в experiment.metrics или выберите другую selection_metric."
+        )
+
+    return f"{statistic}_{metric_name}", metric_name, statistic
+
+
+def get_training_loss_name(config: dict[str, Any]) -> str:
+    """Проверяет и возвращает название функции потерь."""
+    raw_value = config["training"].get("loss", "mse")
+
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ValueError("Параметр training.loss должен быть непустой строкой.")
+
+    loss_name = raw_value.strip().lower()
+
+    if loss_name not in SUPPORTED_LOSSES:
+        raise ValueError(
+            f"В training.loss указана неподдерживаемая функция потерь: {loss_name}. "
+            f"Допустимые значения: {list(SUPPORTED_LOSSES)}"
+        )
+
+    return loss_name
 
 
 def load_config(config_path: str | Path) -> tuple[dict[str, Any], Path]:
@@ -49,7 +139,7 @@ def load_config(config_path: str | Path) -> tuple[dict[str, Any], Path]:
 
     validate_config(config)
 
-    return config, infer_project_root(path)
+    return config, path.resolve().parent
 
 
 def validate_config(config: dict[str, Any]) -> None:
@@ -78,18 +168,14 @@ def validate_config(config: dict[str, Any]) -> None:
         "scaler",
         "epsilon",
         "random_seed",
+        "metrics",
     ]
     missing_experiment = [name for name in required_experiment if name not in config["experiment"]]
 
     if missing_experiment:
         raise ValueError(f"В разделе experiment отсутствуют параметры: {missing_experiment}")
 
-
-def infer_project_root(config_path: Path) -> Path:
-    """Определяет корень проекта по расположению файла конфигурации."""
-    parent = config_path.resolve().parent
-
-    return parent
+    validate_experiment_config(config)
 
 
 def resolve_path(path_value: str, project_root: Path) -> Path:
@@ -105,6 +191,11 @@ def resolve_path(path_value: str, project_root: Path) -> Path:
 def uses_extended_feature_set(config: dict[str, Any]) -> bool:
     """Проверяет, выбран ли расширенный набор признаков."""
     return "extended" in [name.lower() for name in config["experiment"]["feature_sets"]]
+
+
+def should_train_final_model(config: dict[str, Any]) -> bool:
+    """Проверяет, включено ли обучение итоговой модели."""
+    return bool(config["experiment"].get("train_final_model", True))
 
 
 def require_columns(df: pd.DataFrame, columns: list[str], source: str) -> None:
@@ -487,19 +578,6 @@ def get_feature_columns(df: pd.DataFrame, feature_set: str) -> list[str]:
     raise ValueError(f"Неизвестный набор признаков в config.json: {feature_set}")
 
 
-def scale_features_for_fold(
-    df: pd.DataFrame,
-    feature_columns: list[str],
-    train_start: int,
-    train_end: int,
-    scaler_name: str,
-) -> np.ndarray:
-    """Масштабирует признаки, обучая преобразователь только на обучающем интервале."""
-    scaled, _ = scale_features_for_window(df, feature_columns, train_start, train_end, scaler_name)
-
-    return scaled
-
-
 def scale_features_for_window(
     df: pd.DataFrame,
     feature_columns: list[str],
@@ -602,6 +680,45 @@ def empty_sequences(
     return x, np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.int64)
 
 
+def make_train_test_sequences(
+    data: pd.DataFrame,
+    scaled_features: np.ndarray,
+    model_name: str,
+    train_start: int,
+    train_end: int,
+    test_start: int,
+    test_end: int,
+    config: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Формирует обучающие и тестовые последовательности для заданного временного разреза."""
+    experiment_config = config["experiment"]
+    input_window = int(experiment_config["input_window"])
+    forecast_horizon = int(experiment_config["forecast_horizon"])
+    y_log = data["log_realized_volatility"].to_numpy(dtype=np.float64)
+    x_train, y_train, _ = make_sequences(
+        features=scaled_features,
+        y_log=y_log,
+        target_start=train_start,
+        target_end=train_end,
+        input_window=input_window,
+        forecast_horizon=forecast_horizon,
+        model_name=model_name,
+        min_input_index=train_start,
+    )
+    x_test, y_test, target_indices = make_sequences(
+        features=scaled_features,
+        y_log=y_log,
+        target_start=test_start,
+        target_end=test_end,
+        input_window=input_window,
+        forecast_horizon=forecast_horizon,
+        model_name=model_name,
+        min_input_index=train_start,
+    )
+
+    return x_train, y_train, x_test, y_test, target_indices
+
+
 # Модуль моделей и оценки качества
 
 def inverse_log_volatility(y_log: np.ndarray, epsilon: float) -> np.ndarray:
@@ -615,10 +732,16 @@ def calculate_metrics(
     y_true_sigma: np.ndarray,
     y_pred_sigma: np.ndarray,
     epsilon: float,
+    y_reference_sigma: np.ndarray | None = None,
+    metric_names: list[str] | None = None,
 ) -> dict[str, float]:
-    """Считает MAE, RMSE и MAPE на исходной шкале реализованной волатильности."""
+    """Считает метрики на исходной шкале реализованной волатильности."""
+    selected_metrics = list(SUPPORTED_METRICS) if metric_names is None else normalize_metric_names(metric_names)
     true_sigma = np.asarray(y_true_sigma, dtype=np.float64)
     pred_sigma = np.asarray(y_pred_sigma, dtype=np.float64)
+
+    if epsilon <= 0:
+        raise ValueError("Малая добавка epsilon должна быть положительной.")
 
     if true_sigma.shape != pred_sigma.shape:
         raise ValueError("Фактические и прогнозные значения должны иметь одинаковую форму.")
@@ -630,15 +753,118 @@ def calculate_metrics(
         raise ValueError("Фактическая реализованная волатильность не может быть отрицательной.")
 
     pred_sigma = np.maximum(pred_sigma, epsilon)
-    errors = pred_sigma - true_sigma
-    denominator = true_sigma + epsilon
-    mape = np.mean(np.abs(errors) / denominator) * 100.0
+    reference_sigma = None
 
-    return {
-        "MAE": float(np.mean(np.abs(errors))),
-        "RMSE": float(math.sqrt(float(np.mean(np.square(errors))))),
-        "MAPE": float(mape),
-    }
+    if "DA" in selected_metrics and y_reference_sigma is not None:
+        reference_sigma = np.asarray(y_reference_sigma, dtype=np.float64)
+
+        if true_sigma.shape != reference_sigma.shape:
+            raise ValueError("Базовые значения для DA должны иметь ту же форму, что и фактические значения.")
+
+        if not np.isfinite(reference_sigma).all():
+            raise ValueError("В базовых значениях для DA есть NaN или бесконечные значения.")
+
+        if (reference_sigma < 0).any():
+            raise ValueError("Базовая реализованная волатильность для DA не может быть отрицательной.")
+
+    metric_values: dict[str, float] = {}
+    errors = pred_sigma - true_sigma
+
+    if "MAE" in selected_metrics:
+        metric_values["MAE"] = float(np.mean(np.abs(errors)))
+
+    if "MSE" in selected_metrics or "RMSE" in selected_metrics or "R2" in selected_metrics:
+        squared_errors = np.square(errors)
+
+        if "MSE" in selected_metrics or "RMSE" in selected_metrics:
+            mse = float(np.mean(squared_errors))
+
+            if "MSE" in selected_metrics:
+                metric_values["MSE"] = mse
+
+            if "RMSE" in selected_metrics:
+                metric_values["RMSE"] = float(math.sqrt(mse))
+
+        if "R2" in selected_metrics:
+            residual_sum_of_squares = float(np.sum(squared_errors))
+            total_sum_of_squares = float(np.sum(np.square(true_sigma - np.mean(true_sigma))))
+
+            if math.isclose(total_sum_of_squares, 0.0, abs_tol=epsilon):
+                r2 = 1.0 if math.isclose(residual_sum_of_squares, 0.0, abs_tol=epsilon) else 0.0
+            else:
+                r2 = 1.0 - residual_sum_of_squares / total_sum_of_squares
+
+            metric_values["R2"] = float(r2)
+
+    if "MAPE" in selected_metrics:
+        denominator = true_sigma + epsilon
+        metric_values["MAPE"] = float(np.mean(np.abs(errors) / denominator) * 100.0)
+
+    if "QLIKE" in selected_metrics:
+        variance_floor = epsilon**2
+        true_variance = np.maximum(np.square(true_sigma), variance_floor)
+        pred_variance = np.maximum(np.square(pred_sigma), variance_floor)
+        variance_ratio = true_variance / pred_variance
+        metric_values["QLIKE"] = float(np.mean(variance_ratio - np.log(variance_ratio) - 1.0))
+
+    if "DA" in selected_metrics:
+        metric_values["DA"] = calculate_directional_accuracy(true_sigma, pred_sigma, reference_sigma)
+
+    return {metric_name: metric_values[metric_name] for metric_name in selected_metrics}
+
+
+def calculate_directional_accuracy(
+    true_sigma: np.ndarray,
+    pred_sigma: np.ndarray,
+    reference_sigma: np.ndarray | None,
+) -> float:
+    """Считает долю совпадений направления изменения волатильности в процентах."""
+    if reference_sigma is None:
+        if len(true_sigma) < 2:
+            return 0.0
+
+        actual_direction = np.sign(np.diff(true_sigma))
+        predicted_direction = np.sign(np.diff(pred_sigma))
+    else:
+        actual_direction = np.sign(true_sigma - reference_sigma)
+        predicted_direction = np.sign(pred_sigma - reference_sigma)
+
+    valid_direction = actual_direction != 0
+
+    if not valid_direction.any():
+        return 0.0
+
+    return float(np.mean(actual_direction[valid_direction] == predicted_direction[valid_direction]) * 100.0)
+
+
+@keras.utils.register_keras_serializable(package="btc_volatility")
+def qlike_loss(y_true_log: tf.Tensor, y_pred_log: tf.Tensor) -> tf.Tensor:
+    """Считает дифференцируемую QLIKE-потерю по логарифмам регуляризованной дисперсии."""
+    y_true_log = tf.reshape(tf.cast(y_true_log, y_pred_log.dtype), tf.shape(y_pred_log))
+    log_variance_ratio = 2.0 * (y_true_log - y_pred_log)
+    limit = tf.cast(QLIKE_LOG_RATIO_LIMIT, y_pred_log.dtype)
+    capped_log_ratio = tf.minimum(log_variance_ratio, limit)
+    capped_exponential = tf.exp(capped_log_ratio)
+    regular_loss = capped_exponential - log_variance_ratio - 1.0
+    limit_exponential = tf.exp(limit)
+    loss_at_limit = limit_exponential - limit - 1.0
+    linear_tail = loss_at_limit + (limit_exponential - 1.0) * (log_variance_ratio - limit)
+    elementwise_loss = tf.where(log_variance_ratio <= limit, regular_loss, linear_tail)
+
+    return tf.reduce_mean(elementwise_loss, axis=-1)
+
+
+def get_training_loss(config: dict[str, Any]) -> Any:
+    """Возвращает функцию потерь Keras по конфигурации обучения."""
+    loss_name = get_training_loss_name(config)
+
+    if loss_name == "qlike":
+        return qlike_loss
+
+    if loss_name == "huber":
+        return keras.losses.Huber()
+
+    return loss_name
 
 
 def build_model(model_name: str, input_shape: tuple[int, ...], config: dict[str, Any]) -> keras.Model:
@@ -670,7 +896,7 @@ def build_mlp(input_shape: tuple[int, ...], config: dict[str, Any]) -> keras.Mod
         learning_rate=float(training_config["learning_rate"]),
         clipnorm=1.0,
     )
-    model.compile(optimizer=optimizer, loss="mse", metrics=["mae"])
+    model.compile(optimizer=optimizer, loss=get_training_loss(config), metrics=["mae"])
 
     return model
 
@@ -701,7 +927,7 @@ def build_lstm(input_shape: tuple[int, ...], config: dict[str, Any]) -> keras.Mo
         learning_rate=float(training_config["learning_rate"]),
         clipnorm=1.0,
     )
-    model.compile(optimizer=optimizer, loss="mse", metrics=["mae"])
+    model.compile(optimizer=optimizer, loss=get_training_loss(config), metrics=["mae"])
 
     return model
 
@@ -722,32 +948,67 @@ def save_plots(predictions: pd.DataFrame, summary: pd.DataFrame, plots_dir: Path
             .agg(y_true_sigma=("y_true_sigma", "first"), y_pred_sigma=("y_pred_sigma", "mean"))
             .sort_values("target_date")
         )
-        plt.figure(figsize=(12, 5))
-        plt.plot(by_date["target_date"], by_date["y_true_sigma"], label="Фактическая волатильность")
-        plt.plot(by_date["target_date"], by_date["y_pred_sigma"], label="Прогнозная волатильность")
-        plt.title(f"{model_name} + {feature_set}: фактическая и прогнозная волатильность")
-        plt.xlabel("Дата")
-        plt.ylabel("Реализованная волатильность")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"actual_vs_predicted_{safe_filename(model_name)}_{safe_filename(feature_set)}.png", dpi=150)
-        plt.close()
+        save_volatility_plot(
+            plot_data=by_date,
+            title=f"{model_name} + {feature_set}: фактическая и прогнозная волатильность",
+            path=plots_dir / f"actual_vs_predicted_{safe_filename(model_name)}_{safe_filename(feature_set)}.png",
+        )
 
     if summary.empty:
         raise ValueError("Нельзя построить сравнение метрик: сводная таблица пуста.")
 
     labels = summary["model_name"].astype(str) + " + " + summary["feature_set"].astype(str)
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    mean_metric_columns = [column for column in summary.columns if column.startswith("mean_")]
+    median_metric_columns = [column for column in summary.columns if column.startswith("median_")]
 
-    for axis, metric in zip(axes, ["mean_MAE", "mean_RMSE", "mean_MAPE"], strict=True):
-        axis.bar(labels, summary[metric])
+    if not mean_metric_columns:
+        raise ValueError("Нельзя построить сравнение метрик: в сводной таблице нет колонок mean_*.")
+
+    if not median_metric_columns:
+        raise ValueError("Нельзя построить сравнение медианных метрик: в сводной таблице нет колонок median_*.")
+
+    save_metrics_comparison_plot(summary, labels, mean_metric_columns, plots_dir / "metrics_comparison.png")
+    save_metrics_comparison_plot(summary, labels, median_metric_columns, plots_dir / "metrics_comparison_median.png")
+
+
+def save_volatility_plot(plot_data: pd.DataFrame, title: str, path: Path) -> None:
+    """Сохраняет график фактической и прогнозной волатильности."""
+    plt.figure(figsize=(12, 5))
+    plt.plot(plot_data["target_date"], plot_data["y_true_sigma"], label="Фактическая волатильность")
+    plt.plot(plot_data["target_date"], plot_data["y_pred_sigma"], label="Прогнозная волатильность")
+    plt.title(title)
+    plt.xlabel("Дата")
+    plt.ylabel("Реализованная волатильность")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def save_metrics_comparison_plot(
+    summary: pd.DataFrame,
+    labels: pd.Series,
+    metric_columns: list[str],
+    path: Path,
+) -> None:
+    """Сохраняет график сравнения выбранных метрик по конфигурациям."""
+    n_columns = min(3, len(metric_columns))
+    n_rows = math.ceil(len(metric_columns) / n_columns)
+    fig, axes = plt.subplots(n_rows, n_columns, figsize=(5.5 * n_columns, 4.5 * n_rows), squeeze=False)
+    flat_axes = axes.ravel()
+
+    for axis, metric in zip(flat_axes, metric_columns, strict=False):
+        axis.bar(labels, summary[metric].astype(float))
         axis.set_title(metric)
         axis.set_xlabel("Конфигурация")
         axis.set_ylabel("Значение")
         axis.tick_params(axis="x", rotation=45)
 
+    for axis in flat_axes[len(metric_columns) :]:
+        axis.set_visible(False)
+
     fig.tight_layout()
-    fig.savefig(plots_dir / "metrics_comparison.png", dpi=150)
+    fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
@@ -766,7 +1027,6 @@ def run_experiments(
     project_root: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Запускает скользящую временную проверку для всех моделей и наборов признаков."""
-    validate_experiment_config(config)
     set_random_seed(int(config["experiment"]["random_seed"]))
     result_paths = create_result_dirs(config, project_root)
     data = add_log_features(daily_df, config)
@@ -821,7 +1081,7 @@ def run_experiments(
     LOGGER.info("Выполнено запусков для шагов проверки, моделей и наборов признаков: %s.", len(folds) * len(models) * len(feature_sets))
     predictions = pd.DataFrame(predictions_rows)
     metrics_by_fold = pd.DataFrame(metrics_rows)
-    metrics_summary = summarize_metrics(metrics_by_fold)
+    metrics_summary = summarize_metrics(metrics_by_fold, get_enabled_metrics(config))
     save_results(predictions, metrics_by_fold, metrics_summary, config, result_paths)
 
     if config["saving"]["save_plots"]:
@@ -844,35 +1104,22 @@ def run_single_fold(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Обучает одну модель на одном шаге проверки и возвращает прогнозы с метриками."""
     experiment_config = config["experiment"]
-    input_window = int(experiment_config["input_window"])
-    forecast_horizon = int(experiment_config["forecast_horizon"])
-    scaled_features = scale_features_for_fold(
+    scaled_features, _ = scale_features_for_window(
         df=data,
         feature_columns=feature_columns,
         train_start=train_start,
         train_end=train_end,
         scaler_name=experiment_config["scaler"],
     )
-    y_log = data["log_realized_volatility"].to_numpy(dtype=np.float64)
-    x_train, y_train, _ = make_sequences(
-        features=scaled_features,
-        y_log=y_log,
-        target_start=train_start,
-        target_end=train_end,
-        input_window=input_window,
-        forecast_horizon=forecast_horizon,
+    x_train, y_train, x_test, y_test, target_indices = make_train_test_sequences(
+        data=data,
+        scaled_features=scaled_features,
         model_name=model_name,
-        min_input_index=train_start,
-    )
-    x_test, y_test, target_indices = make_sequences(
-        features=scaled_features,
-        y_log=y_log,
-        target_start=test_start,
-        target_end=test_end,
-        input_window=input_window,
-        forecast_horizon=forecast_horizon,
-        model_name=model_name,
-        min_input_index=train_start,
+        train_start=train_start,
+        train_end=train_end,
+        test_start=test_start,
+        test_end=test_end,
+        config=config,
     )
 
     if len(x_train) == 0:
@@ -895,18 +1142,20 @@ def run_single_fold(
         len(x_train),
         len(x_test),
     )
-    y_pred_log = train_and_predict(
+    _, y_pred_log = fit_and_predict_model(
         model_name=model_name,
-        fold=fold,
         x_train=x_train,
         y_train=y_train,
         x_test=x_test,
         config=config,
+        seed=int(experiment_config["random_seed"]) + fold,
     )
-    epsilon = float(experiment_config["epsilon"])
-    y_pred_sigma = inverse_log_volatility(y_pred_log, epsilon)
-    y_true_sigma = data["realized_volatility"].to_numpy(dtype=np.float64)[target_indices]
-    metrics = calculate_metrics(y_true_sigma, y_pred_sigma, epsilon)
+    y_true_sigma, y_pred_sigma, metrics = evaluate_predictions(
+        data=data,
+        target_indices=target_indices,
+        y_pred_log=y_pred_log,
+        config=config,
+    )
     metrics_row = {
         "fold": fold,
         "model_name": model_name.upper(),
@@ -929,25 +1178,50 @@ def run_single_fold(
     return prediction_rows, metrics_row
 
 
-def train_and_predict(
+def fit_and_predict_model(
     model_name: str,
-    fold: int,
     x_train: np.ndarray,
     y_train: np.ndarray,
     x_test: np.ndarray,
     config: dict[str, Any],
-) -> np.ndarray:
-    """Создает новую модель для шага проверки, обучает ее и возвращает прогнозы в логарифмической шкале."""
-    seed = int(config["experiment"]["random_seed"]) + fold
-    model = fit_model(model_name, x_train, y_train, config, seed)
+    seed: int,
+    validation_split: float | None = None,
+) -> tuple[keras.Model, np.ndarray]:
+    """Обучает модель и возвращает ее вместе с прогнозом в логарифмической шкале."""
+    model = fit_model(model_name, x_train, y_train, config, seed, validation_split)
     training_config = config["training"]
     predictions = model.predict(
         x_test,
         batch_size=int(training_config["batch_size"]),
-        verbose=0,
+        verbose=int(training_config["verbose"]),
     ).reshape(-1)
 
-    return predictions.astype(np.float64)
+    return model, predictions.astype(np.float64)
+
+
+def evaluate_predictions(
+    data: pd.DataFrame,
+    target_indices: np.ndarray,
+    y_pred_log: np.ndarray,
+    config: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Восстанавливает волатильность и рассчитывает выбранные метрики прогноза."""
+    experiment_config = config["experiment"]
+    epsilon = float(experiment_config["epsilon"])
+    forecast_horizon = int(experiment_config["forecast_horizon"])
+    y_pred_sigma = inverse_log_volatility(y_pred_log, epsilon)
+    realized_volatility = data["realized_volatility"].to_numpy(dtype=np.float64)
+    y_true_sigma = realized_volatility[target_indices]
+    y_reference_sigma = realized_volatility[target_indices - forecast_horizon]
+    metrics = calculate_metrics(
+        y_true_sigma,
+        y_pred_sigma,
+        epsilon,
+        y_reference_sigma,
+        get_enabled_metrics(config),
+    )
+
+    return y_true_sigma, y_pred_sigma, metrics
 
 
 def fit_model(
@@ -956,19 +1230,23 @@ def fit_model(
     y_train: np.ndarray,
     config: dict[str, Any],
     seed: int,
+    validation_split: float | None = None,
 ) -> keras.Model:
     """Обучает модель с ранней остановкой и возвращает экземпляр Keras."""
     set_random_seed(seed)
     keras.backend.clear_session()
     model = build_model(model_name, tuple(x_train.shape[1:]), config)
-    callbacks = build_callbacks(config)
     training_config = config["training"]
+    effective_validation_split = (
+        float(training_config["validation_split"]) if validation_split is None else float(validation_split)
+    )
+    callbacks = build_callbacks(config, effective_validation_split)
     model.fit(
         x_train,
         y_train,
         epochs=int(training_config["epochs"]),
         batch_size=int(training_config["batch_size"]),
-        validation_split=float(training_config["validation_split"]),
+        validation_split=effective_validation_split,
         shuffle=False,
         verbose=int(training_config["verbose"]),
         callbacks=callbacks,
@@ -977,11 +1255,11 @@ def fit_model(
     return model
 
 
-def build_callbacks(config: dict[str, Any]) -> list[Any]:
+def build_callbacks(config: dict[str, Any], validation_split: float) -> list[Any]:
     """Создает обработчики Keras для ранней остановки."""
     callbacks: list[Any] = []
     training_config = config["training"]
-    monitor = "val_loss" if float(training_config["validation_split"]) > 0 else "loss"
+    monitor = "val_loss" if validation_split > 0 else "loss"
 
     if training_config["early_stopping"]:
         callbacks.append(
@@ -997,7 +1275,6 @@ def build_callbacks(config: dict[str, Any]) -> list[Any]:
 
 def build_prediction_rows(
     data: pd.DataFrame,
-    fold: int,
     model_name: str,
     feature_set: str,
     target_indices: np.ndarray,
@@ -1005,24 +1282,29 @@ def build_prediction_rows(
     y_pred_log: np.ndarray,
     y_true_sigma: np.ndarray,
     y_pred_sigma: np.ndarray,
+    fold: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Формирует строки таблицы прогнозов для одного шага проверки."""
+    """Формирует строки таблицы прогнозов для шага проверки или итоговой модели."""
     rows: list[dict[str, Any]] = []
 
     for position, target_index in enumerate(target_indices):
-        target_date = pd.Timestamp(data.loc[int(target_index), "date_utc"]).date().isoformat()
-        rows.append(
+        row: dict[str, Any] = {}
+
+        if fold is not None:
+            row["fold"] = fold
+
+        row.update(
             {
-                "fold": fold,
                 "model_name": model_name.upper(),
                 "feature_set": feature_set,
-                "target_date": target_date,
+                "target_date": format_date(data.loc[int(target_index), "date_utc"]),
                 "y_true_log": float(y_true_log[position]),
                 "y_pred_log": float(y_pred_log[position]),
                 "y_true_sigma": float(y_true_sigma[position]),
                 "y_pred_sigma": float(y_pred_sigma[position]),
             }
         )
+        rows.append(row)
 
     return rows
 
@@ -1047,24 +1329,26 @@ def iter_sliding_windows(
         start += step_size
 
 
-def summarize_metrics(metrics_by_fold: pd.DataFrame) -> pd.DataFrame:
-    """Усредняет метрики по шагам проверки для каждой пары модель + набор признаков."""
+def summarize_metrics(metrics_by_fold: pd.DataFrame, metric_names: list[str] | None = None) -> pd.DataFrame:
+    """Агрегирует mean, std и median по шагам проверки для каждой пары модель + набор признаков."""
     if metrics_by_fold.empty:
         raise ValueError("Нет метрик для построения итоговой сводки.")
 
-    return (
-        metrics_by_fold.groupby(["model_name", "feature_set"], as_index=False)
-        .agg(
-            mean_MAE=("MAE", "mean"),
-            std_MAE=("MAE", "std"),
-            mean_RMSE=("RMSE", "mean"),
-            std_RMSE=("RMSE", "std"),
-            mean_MAPE=("MAPE", "mean"),
-            std_MAPE=("MAPE", "std"),
-            n_folds=("fold", "nunique"),
-        )
-        .fillna(0.0)
-    )
+    selected_metrics = list(SUPPORTED_METRICS) if metric_names is None else normalize_metric_names(metric_names)
+    missing_metrics = [metric_name for metric_name in selected_metrics if metric_name not in metrics_by_fold.columns]
+
+    if missing_metrics:
+        raise ValueError(f"В таблице метрик по фолдам отсутствуют выбранные метрики: {missing_metrics}")
+
+    aggregations: dict[str, tuple[str, str]] = {}
+
+    for metric_name in selected_metrics:
+        for statistic in SUMMARY_STATISTICS:
+            aggregations[f"{statistic}_{metric_name}"] = (metric_name, statistic)
+
+    aggregations["n_folds"] = ("fold", "nunique")
+
+    return metrics_by_fold.groupby(["model_name", "feature_set"], as_index=False).agg(**aggregations).fillna(0.0)
 
 
 def save_results(
@@ -1094,23 +1378,23 @@ def select_best_configuration(metrics_summary: pd.DataFrame, config: dict[str, A
     if metrics_summary.empty:
         raise ValueError("Нельзя выбрать лучшую конфигурацию: сводная таблица метрик пуста.")
 
-    selection_metric = str(
-        config["experiment"].get("selection_metric", config["saving"].get("selection_metric", "mae"))
-    ).strip()
-    base_metric = selection_metric[5:] if selection_metric.lower().startswith("mean_") else selection_metric
-    metric_column = selection_metric if selection_metric in metrics_summary.columns else f"mean_{base_metric.upper()}"
+    metric_column, base_metric, statistic = resolve_selection_metric(config)
 
     if metric_column not in metrics_summary.columns:
         raise ValueError(f"В сводной таблице метрик нет колонки для выбора лучшей конфигурации: {metric_column}")
 
-    best_index = metrics_summary[metric_column].astype(float).idxmin()
+    metric_values = metrics_summary[metric_column].astype(float)
+    maximize_metric = base_metric in MAXIMIZED_METRICS and statistic != "std"
+    best_index = metric_values.idxmax() if maximize_metric else metric_values.idxmin()
+    selection_direction = "максимальному" if maximize_metric else "минимальному"
     best_row = metrics_summary.loc[best_index]
     model_name = str(best_row["model_name"]).lower()
     feature_set = str(best_row["feature_set"]).lower()
     LOGGER.info(
-        "Выбрана итоговая конфигурация: %s + %s по минимальному %s.",
+        "Выбрана итоговая конфигурация: %s + %s по %s %s.",
         model_name.upper(),
         feature_set,
+        selection_direction,
         metric_column,
     )
 
@@ -1124,24 +1408,24 @@ def train_final_model(
     model_name: str,
     feature_set: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Обучает итоговую модель на последнем обучающем окне и сохраняет артефакты."""
+    """Обучает итоговую модель на всем диапазоне кроме последнего тестового окна и сохраняет артефакты."""
     result_paths = create_result_dirs(config, project_root)
     data = add_log_features(daily_df, config)
     feature_columns = get_feature_columns(data, feature_set)
     experiment_config = config["experiment"]
     input_window = int(experiment_config["input_window"])
     forecast_horizon = int(experiment_config["forecast_horizon"])
-    train_window = int(experiment_config["train_window"])
     test_window = int(experiment_config["test_window"])
+    epsilon = float(experiment_config["epsilon"])
+    train_start = 0
     test_end = len(data)
     test_start = test_end - test_window
     train_end = test_start
-    train_start = train_end - train_window
 
-    if train_start < 0:
+    if train_end <= input_window:
         raise ValueError(
             "Недостаточно суточных наблюдений для итогового train/test-разреза. "
-            f"Доступно: {len(data)}; требуется минимум: {train_window + test_window}."
+            f"Доступно: {len(data)}; требуется больше {input_window + test_window}."
         )
 
     scaled_features, scaler = scale_features_for_window(
@@ -1151,26 +1435,15 @@ def train_final_model(
         train_end=train_end,
         scaler_name=experiment_config["scaler"],
     )
-    y_log = data["log_realized_volatility"].to_numpy(dtype=np.float64)
-    x_train, y_train, _ = make_sequences(
-        features=scaled_features,
-        y_log=y_log,
-        target_start=train_start,
-        target_end=train_end,
-        input_window=input_window,
-        forecast_horizon=forecast_horizon,
+    x_train, y_train, x_test, y_test, target_indices = make_train_test_sequences(
+        data=data,
+        scaled_features=scaled_features,
         model_name=model_name,
-        min_input_index=train_start,
-    )
-    x_test, y_test, target_indices = make_sequences(
-        features=scaled_features,
-        y_log=y_log,
-        target_start=test_start,
-        target_end=test_end,
-        input_window=input_window,
-        forecast_horizon=forecast_horizon,
-        model_name=model_name,
-        min_input_index=train_start,
+        train_start=train_start,
+        train_end=train_end,
+        test_start=test_start,
+        test_end=test_end,
+        config=config,
     )
 
     if len(x_train) == 0:
@@ -1186,19 +1459,23 @@ def train_final_model(
         len(x_train),
         len(x_test),
     )
-    model = fit_model(model_name, x_train, y_train, config, int(experiment_config["random_seed"]))
-    training_config = config["training"]
-    y_pred_log = model.predict(
-        x_test,
-        batch_size=int(training_config["batch_size"]),
-        verbose=0,
-    ).reshape(-1).astype(np.float64)
-    epsilon = float(experiment_config["epsilon"])
-    y_pred_sigma = inverse_log_volatility(y_pred_log, epsilon)
-    y_true_sigma = data["realized_volatility"].to_numpy(dtype=np.float64)[target_indices]
-    metrics = calculate_metrics(y_true_sigma, y_pred_sigma, epsilon)
+    model, y_pred_log = fit_and_predict_model(
+        model_name=model_name,
+        x_train=x_train,
+        y_train=y_train,
+        x_test=x_test,
+        config=config,
+        seed=int(experiment_config["random_seed"]),
+        validation_split=0.0,
+    )
+    y_true_sigma, y_pred_sigma, metrics = evaluate_predictions(
+        data=data,
+        target_indices=target_indices,
+        y_pred_log=y_pred_log,
+        config=config,
+    )
     final_predictions = pd.DataFrame(
-        build_final_prediction_rows(
+        build_prediction_rows(
             data=data,
             model_name=model_name,
             feature_set=feature_set,
@@ -1215,7 +1492,9 @@ def train_final_model(
                 "model_name": model_name.upper(),
                 "feature_set": feature_set,
                 **metrics,
+                "n_train": int(len(y_train)),
                 "n_test": int(len(y_test)),
+                "training_scope": "all_except_final_test_window",
                 "final_train_start_date": format_date(data.loc[train_start, "date_utc"]),
                 "final_train_end_date": format_date(data.loc[train_end - 1, "date_utc"]),
                 "final_test_start_date": format_date(data.loc[test_start, "date_utc"]),
@@ -1228,12 +1507,14 @@ def train_final_model(
         "selected_feature_set": feature_set,
         "input_window": input_window,
         "forecast_horizon": forecast_horizon,
-        "train_window": train_window,
-        "test_window": test_window,
+        "final_test_window": test_window,
+        "training_scope": "all_except_final_test_window",
         "scaler": experiment_config["scaler"],
         "epsilon": epsilon,
         "feature_columns": feature_columns,
         "target_column": "log_realized_volatility",
+        "n_train": int(len(y_train)),
+        "validation_split": 0.0,
         "final_train_start_date": format_date(data.loc[train_start, "date_utc"]),
         "final_train_end_date": format_date(data.loc[train_end - 1, "date_utc"]),
         "final_test_start_date": format_date(data.loc[test_start, "date_utc"]),
@@ -1253,33 +1534,19 @@ def train_final_model(
     return final_predictions, final_metrics
 
 
-def build_final_prediction_rows(
-    data: pd.DataFrame,
-    model_name: str,
-    feature_set: str,
-    target_indices: np.ndarray,
-    y_true_log: np.ndarray,
-    y_pred_log: np.ndarray,
-    y_true_sigma: np.ndarray,
-    y_pred_sigma: np.ndarray,
-) -> list[dict[str, Any]]:
-    """Формирует строки итогового прогноза."""
-    rows: list[dict[str, Any]] = []
-
-    for position, target_index in enumerate(target_indices):
-        rows.append(
-            {
-                "model_name": model_name.upper(),
-                "feature_set": feature_set,
-                "target_date": format_date(data.loc[int(target_index), "date_utc"]),
-                "y_true_log": float(y_true_log[position]),
-                "y_pred_log": float(y_pred_log[position]),
-                "y_true_sigma": float(y_true_sigma[position]),
-                "y_pred_sigma": float(y_pred_sigma[position]),
-            }
-        )
-
-    return rows
+def build_empty_final_predictions() -> pd.DataFrame:
+    """Создает пустую таблицу итоговых прогнозов с ожидаемыми колонками."""
+    return pd.DataFrame(
+        columns=[
+            "model_name",
+            "feature_set",
+            "target_date",
+            "y_true_log",
+            "y_pred_log",
+            "y_true_sigma",
+            "y_pred_sigma",
+        ]
+    )
 
 
 def save_final_artifacts(
@@ -1297,9 +1564,10 @@ def save_final_artifacts(
     metrics_path = results_dir / "final_metrics.csv"
     final_predictions.to_csv(predictions_path, index=False)
     final_metrics.to_csv(metrics_path, index=False)
-    save_final_prediction_plot(final_predictions, results_dir / "final_prediction_plot.png")
     LOGGER.info("Итоговые прогнозы сохранены в %s.", predictions_path)
     LOGGER.info("Итоговые метрики сохранены в %s.", metrics_path)
+
+    save_final_prediction_plot(final_predictions, results_dir / "final_prediction_plot.png")
 
     if not config["saving"]["save_models"]:
         return
@@ -1328,16 +1596,7 @@ def save_final_prediction_plot(final_predictions: pd.DataFrame, path: Path) -> N
     plot_data = final_predictions.copy()
     plot_data["target_date"] = pd.to_datetime(plot_data["target_date"])
     plot_data = plot_data.sort_values("target_date")
-    plt.figure(figsize=(12, 5))
-    plt.plot(plot_data["target_date"], plot_data["y_true_sigma"], label="Фактическая волатильность")
-    plt.plot(plot_data["target_date"], plot_data["y_pred_sigma"], label="Прогнозная волатильность")
-    plt.title("Итоговая модель: фактическая и прогнозная волатильность")
-    plt.xlabel("Дата")
-    plt.ylabel("Реализованная волатильность")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
-    plt.close()
+    save_volatility_plot(plot_data, "Итоговая модель: фактическая и прогнозная волатильность", path)
     LOGGER.info("Итоговый график сохранен в %s.", path)
 
 
@@ -1354,7 +1613,6 @@ def create_result_dirs(config: dict[str, Any], project_root: Path) -> dict[str, 
         "predictions": base / "predictions",
         "metrics": base / "metrics",
         "plots": base / "plots",
-        "models": base / "models",
     }
 
     for path in result_paths.values():
@@ -1365,6 +1623,9 @@ def create_result_dirs(config: dict[str, Any], project_root: Path) -> dict[str, 
 
 def validate_experiment_config(config: dict[str, Any]) -> None:
     """Проверяет модели, наборы признаков и размеры окон перед запуском."""
+    get_enabled_metrics(config)
+    resolve_selection_metric(config)
+    get_training_loss_name(config)
     models = [name.lower() for name in config["experiment"]["models"]]
     feature_sets = [name.lower() for name in config["experiment"]["feature_sets"]]
     unknown_models = sorted(set(models) - VALID_MODELS)
@@ -1389,6 +1650,9 @@ def validate_experiment_config(config: dict[str, Any]) -> None:
 
     if step_size < 1:
         raise ValueError("Параметр experiment.step_size должен быть положительным.")
+
+    if "train_final_model" in config["experiment"] and not isinstance(config["experiment"]["train_final_model"], bool):
+        raise ValueError("Параметр experiment.train_final_model должен быть логическим значением true или false.")
 
 
 def set_random_seed(seed: int) -> None:
@@ -1418,19 +1682,31 @@ def main(config_file: str | Path = CONFIG_FILE) -> tuple[pd.DataFrame, pd.DataFr
     config, project_root = load_config(config_path)
     LOGGER.info("Конфигурация загружена из %s.", config_path)
     LOGGER.info("Активные наборы признаков: %s.", ", ".join(config["experiment"]["feature_sets"]))
+    LOGGER.info("Функция потерь: %s.", get_training_loss_name(config))
     LOGGER.info("Корень проекта: %s.", project_root)
 
     daily_dataset = build_daily_dataset(config, project_root)
     LOGGER.info("Сформирован суточный набор данных, строк: %s.", len(daily_dataset))
     predictions, metrics_by_fold, metrics_summary = run_experiments(daily_dataset, config, project_root)
-    best_model_name, best_feature_set = select_best_configuration(metrics_summary, config)
-    final_predictions, final_metrics = train_final_model(
-        daily_df=daily_dataset,
-        config=config,
-        project_root=project_root,
-        model_name=best_model_name,
-        feature_set=best_feature_set,
-    )
+    final_predictions = build_empty_final_predictions()
+    final_metrics = pd.DataFrame()
+
+    if should_train_final_model(config):
+        if not config["saving"]["save_models"]:
+            LOGGER.warning(
+                "Итоговая модель будет обучена, но не будет сохранена, потому что saving.save_models=false."
+            )
+
+        best_model_name, best_feature_set = select_best_configuration(metrics_summary, config)
+        final_predictions, final_metrics = train_final_model(
+            daily_df=daily_dataset,
+            config=config,
+            project_root=project_root,
+            model_name=best_model_name,
+            feature_set=best_feature_set,
+        )
+    else:
+        LOGGER.info("Обучение итоговой модели отключено параметром experiment.train_final_model=false.")
 
     return predictions, metrics_by_fold, metrics_summary, final_predictions, final_metrics
 
