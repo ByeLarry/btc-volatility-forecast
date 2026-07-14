@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 
 logging.basicConfig(
@@ -36,6 +37,7 @@ EXPECTED_INTRADAY_POINTS = 288
 SUPPORTED_METRICS = ("MAE", "MSE", "RMSE", "MAPE", "QLIKE", "R2", "DA")
 SUMMARY_STATISTICS = ("mean", "std", "median")
 MAXIMIZED_METRICS = {"R2", "DA"}
+LOG_SCALE_DISTRIBUTION_METRICS = {"MAE", "MSE", "RMSE", "MAPE", "QLIKE"}
 SUPPORTED_LOSSES = ("mse", "mae", "huber", "qlike")
 QLIKE_LOG_RATIO_LIMIT = 10.0
 
@@ -65,12 +67,12 @@ def normalize_metric_names(metric_names: Any) -> list[str]:
 
 
 def get_enabled_metrics(config: dict[str, Any]) -> list[str]:
-    """Возвращает включенные в конфигурации метрики."""
+    """Возвращает показатели качества, заданные в настройках."""
     return normalize_metric_names(config["experiment"]["metrics"])
 
 
 def resolve_selection_metric(config: dict[str, Any]) -> tuple[str, str, str]:
-    """Проверяет метрику выбора модели и возвращает имя колонки сводки."""
+    """Проверяет метрику выбора модели и возвращает название столбца сводной таблицы."""
     enabled_metrics = get_enabled_metrics(config)
     raw_value = config["experiment"].get("selection_metric", enabled_metrics[0])
 
@@ -126,7 +128,7 @@ def get_training_loss_name(config: dict[str, Any]) -> str:
 
 
 def load_config(config_path: str | Path) -> tuple[dict[str, Any], Path]:
-    """Загружает JSON-конфиг и проверяет наличие обязательных секций."""
+    """Загружает файл настроек JSON и проверяет наличие обязательных разделов."""
     path = Path(config_path).expanduser()
 
     if not path.exists():
@@ -143,7 +145,7 @@ def load_config(config_path: str | Path) -> tuple[dict[str, Any], Path]:
 
 
 def validate_config(config: dict[str, Any]) -> None:
-    """Проверяет, что конфиг содержит все разделы, необходимые для запуска."""
+    """Проверяет наличие в настройках всех разделов, необходимых для запуска."""
     required_sections = ["paths", "experiment", "training", "mlp", "lstm", "saving"]
     missing = [section for section in required_sections if section not in config]
 
@@ -179,7 +181,7 @@ def validate_config(config: dict[str, Any]) -> None:
 
 
 def resolve_path(path_value: str, project_root: Path) -> Path:
-    """Преобразует путь из конфига в абсолютный путь."""
+    """Преобразует путь из настроек в абсолютный путь."""
     path = Path(path_value).expanduser()
 
     if path.is_absolute():
@@ -199,7 +201,7 @@ def should_train_final_model(config: dict[str, Any]) -> bool:
 
 
 def require_columns(df: pd.DataFrame, columns: list[str], source: str) -> None:
-    """Проверяет наличие обязательных колонок во входной таблице."""
+    """Проверяет наличие обязательных столбцов во входной таблице."""
     missing = [column for column in columns if column not in df.columns]
 
     if missing:
@@ -207,7 +209,7 @@ def require_columns(df: pd.DataFrame, columns: list[str], source: str) -> None:
 
 
 def to_utc_datetime(values: pd.Series) -> pd.Series:
-    """Приводит временные метки к timezone-aware формату UTC."""
+    """Приводит временные метки к формату UTC с указанием часового пояса."""
     converted = pd.to_datetime(values, errors="coerce", utc=True)
 
     if converted.isna().any():
@@ -218,7 +220,7 @@ def to_utc_datetime(values: pd.Series) -> pd.Series:
 
 
 def load_market_data(config: dict[str, Any], project_root: Path) -> pd.DataFrame:
-    """Загружает локальные 5-минутные рыночные данные BTC из CSV."""
+    """Загружает локальные 5-минутные рыночные данные Биткойна из файла CSV."""
     path = resolve_path(config["paths"]["market_5m_csv"], project_root)
 
     if not path.exists():
@@ -250,7 +252,7 @@ def load_market_data(config: dict[str, Any], project_root: Path) -> pd.DataFrame
 
 
 def load_network_data(config: dict[str, Any], project_root: Path) -> pd.DataFrame:
-    """Загружает суточные сетевые признаки блокчейна из CSV."""
+    """Загружает суточные показатели сети Биткойн из файла CSV."""
     path = resolve_path(config["paths"]["network_daily_csv"], project_root)
 
     if not path.exists():
@@ -281,7 +283,7 @@ def load_network_data(config: dict[str, Any], project_root: Path) -> pd.DataFram
 
 
 def calculate_daily_realized_volatility(market_df: pd.DataFrame) -> pd.DataFrame:
-    """Рассчитывает дневную реализованную дисперсию и волатильность по 5-минутным close."""
+    """Рассчитывает дневную реализованную дисперсию и волатильность по 5-минутным ценам закрытия."""
     market = market_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
     market = market.set_index("timestamp")
     grid = pd.date_range(
@@ -363,7 +365,7 @@ def align_daily_calendar(
     end_date: pd.Timestamp,
     interpolation_flag_column: str,
 ) -> pd.DataFrame:
-    """Выравнивает суточные данные по полному UTC-календарю и интерполирует внутренние пропуски."""
+    """Выравнивает суточные данные по полному календарю UTC и интерполирует внутренние пропуски."""
     calendar = pd.DataFrame(
         {
             "date_utc": pd.date_range(
@@ -387,7 +389,7 @@ def align_daily_calendar(
 
 
 def build_daily_dataset(config: dict[str, Any], project_root: Path) -> pd.DataFrame:
-    """Формирует итоговый суточный набор данных и сохраняет его в data/processed."""
+    """Формирует итоговый суточный набор данных и сохраняет его в каталоге data/processed."""
     LOGGER.info("Загрузка локальных 5-минутных рыночных данных BTC.")
     market = load_market_data(config, project_root)
     LOGGER.info("Расчет дневной реализованной волатильности.")
@@ -484,7 +486,7 @@ def build_daily_dataset(config: dict[str, Any], project_root: Path) -> pd.DataFr
     return merged
 
 def validate_daily_targets(df: pd.DataFrame) -> None:
-    """Проверяет корректность целевой колонки с реализованной волатильностью."""
+    """Проверяет корректность целевого столбца с реализованной волатильностью."""
     column = "realized_volatility"
 
     if column not in df.columns:
@@ -562,7 +564,7 @@ def add_log_features(df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
 
 
 def get_feature_columns(df: pd.DataFrame, feature_set: str) -> list[str]:
-    """Возвращает список колонок для набора признаков базовых или расширенных."""
+    """Возвращает список столбцов для базового или расширенного набора признаков."""
     if feature_set == "base":
         return ["log_realized_volatility"]
 
@@ -602,7 +604,7 @@ def scale_features_for_window(
 
 
 def create_scaler(name: str) -> StandardScaler | MinMaxScaler:
-    """Создает преобразователь масштаба по имени из config.json."""
+    """Создает преобразователь масштаба по названию из файла настроек config.json."""
     if name == "standard":
         return StandardScaler()
 
@@ -622,7 +624,7 @@ def make_sequences(
     model_name: str,
     min_input_index: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Формирует обучающие или тестовые последовательности без использования будущих значений."""
+    """Формирует обучающие или проверочные последовательности без использования будущих значений."""
     if forecast_horizon != 1:
         raise ValueError("В данной реализации поддерживается горизонт прогноза 1 день.")
 
@@ -690,7 +692,7 @@ def make_train_test_sequences(
     test_end: int,
     config: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Формирует обучающие и тестовые последовательности для заданного временного разреза."""
+    """Формирует обучающие и проверочные последовательности для заданного временного разреза."""
     experiment_config = config["experiment"]
     input_window = int(experiment_config["input_window"])
     forecast_horizon = int(experiment_config["forecast_horizon"])
@@ -722,7 +724,7 @@ def make_train_test_sequences(
 # Модуль моделей и оценки качества
 
 def inverse_log_volatility(y_log: np.ndarray, epsilon: float) -> np.ndarray:
-    """Возвращает прогноз из лог-шкалы в исходную шкалу реализованной волатильности."""
+    """Переводит прогноз из логарифмической шкалы в исходную шкалу реализованной волатильности."""
     sigma = np.exp(np.asarray(y_log, dtype=np.float64)) - epsilon
 
     return np.maximum(sigma, epsilon)
@@ -839,7 +841,7 @@ def calculate_directional_accuracy(
 
 @keras.utils.register_keras_serializable(package="btc_volatility")
 def qlike_loss(y_true_log: tf.Tensor, y_pred_log: tf.Tensor) -> tf.Tensor:
-    """Считает дифференцируемую QLIKE-потерю по логарифмам регуляризованной дисперсии."""
+    """Вычисляет дифференцируемую функцию потерь QLIKE по логарифмам регуляризованной дисперсии."""
     y_true_log = tf.reshape(tf.cast(y_true_log, y_pred_log.dtype), tf.shape(y_pred_log))
     log_variance_ratio = 2.0 * (y_true_log - y_pred_log)
     limit = tf.cast(QLIKE_LOG_RATIO_LIMIT, y_pred_log.dtype)
@@ -855,7 +857,7 @@ def qlike_loss(y_true_log: tf.Tensor, y_pred_log: tf.Tensor) -> tf.Tensor:
 
 
 def get_training_loss(config: dict[str, Any]) -> Any:
-    """Возвращает функцию потерь Keras по конфигурации обучения."""
+    """Возвращает функцию потерь Keras, заданную в настройках обучения."""
     loss_name = get_training_loss_name(config)
 
     if loss_name == "qlike":
@@ -868,7 +870,7 @@ def get_training_loss(config: dict[str, Any]) -> Any:
 
 
 def build_model(model_name: str, input_shape: tuple[int, ...], config: dict[str, Any]) -> keras.Model:
-    """Создает модель по имени из config.json."""
+    """Создает модель по названию из файла настроек config.json."""
     if model_name == "mlp":
         return build_mlp(input_shape, config)
 
@@ -932,8 +934,14 @@ def build_lstm(input_shape: tuple[int, ...], config: dict[str, Any]) -> keras.Mo
     return model
 
 
-def save_plots(predictions: pd.DataFrame, summary: pd.DataFrame, plots_dir: Path) -> None:
-    """Сохраняет графики фактической и прогнозной волатильности и сравнение метрик."""
+def save_plots(
+    predictions: pd.DataFrame,
+    metrics_by_fold: pd.DataFrame,
+    summary: pd.DataFrame,
+    metric_names: list[str],
+    plots_dir: Path,
+) -> None:
+    """Сохраняет графики прогнозов, сводных метрик и их распределений по проверочным интервалам."""
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     if predictions.empty:
@@ -970,6 +978,13 @@ def save_plots(predictions: pd.DataFrame, summary: pd.DataFrame, plots_dir: Path
     save_metrics_comparison_plot(summary, labels, mean_metric_columns, plots_dir / "metrics_comparison.png")
     save_metrics_comparison_plot(summary, labels, median_metric_columns, plots_dir / "metrics_comparison_median.png")
 
+    for metric_name in metric_names:
+        save_metric_distribution_plot(
+            metrics_by_fold=metrics_by_fold,
+            metric_name=metric_name,
+            path=plots_dir / f"metrics_distribution_{safe_filename(metric_name)}.png",
+        )
+
 
 def save_volatility_plot(plot_data: pd.DataFrame, title: str, path: Path) -> None:
     """Сохраняет график фактической и прогнозной волатильности."""
@@ -991,7 +1006,7 @@ def save_metrics_comparison_plot(
     metric_columns: list[str],
     path: Path,
 ) -> None:
-    """Сохраняет график сравнения выбранных метрик по конфигурациям."""
+    """Сохраняет график сравнения выбранных метрик для вариантов моделей."""
     n_columns = min(3, len(metric_columns))
     n_rows = math.ceil(len(metric_columns) / n_columns)
     fig, axes = plt.subplots(n_rows, n_columns, figsize=(5.5 * n_columns, 4.5 * n_rows), squeeze=False)
@@ -1009,6 +1024,110 @@ def save_metrics_comparison_plot(
 
     fig.tight_layout()
     fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def save_metric_distribution_plot(metrics_by_fold: pd.DataFrame, metric_name: str, path: Path) -> None:
+    """Сохраняет распределение метрики по проверочным интервалам для каждого варианта модели."""
+    required_columns = {"model_name", "feature_set", metric_name}
+    missing_columns = sorted(required_columns.difference(metrics_by_fold.columns))
+
+    if missing_columns:
+        raise ValueError(f"Нельзя построить распределение {metric_name}: отсутствуют колонки {missing_columns}.")
+
+    distribution_values = []
+    labels = []
+
+    for (model_name, feature_set), group in metrics_by_fold.groupby(["model_name", "feature_set"], sort=True):
+        values = pd.to_numeric(group[metric_name], errors="coerce").to_numpy(dtype=float)
+
+        if values.size == 0 or not np.isfinite(values).all():
+            raise ValueError(
+                f"Нельзя построить распределение {metric_name} для {model_name} + {feature_set}: "
+                "обнаружены отсутствующие или некорректные значения."
+            )
+
+        distribution_values.append(values)
+        labels.append(f"{model_name} + {feature_set}\n(n={values.size})")
+
+    if not distribution_values:
+        raise ValueError(f"Нельзя построить распределение {metric_name}: таблица метрик пуста.")
+
+    fig, axis = plt.subplots(figsize=(10, 6))
+    boxplot = axis.boxplot(
+        distribution_values,
+        tick_labels=labels,
+        patch_artist=True,
+        widths=0.55,
+        showmeans=True,
+        showfliers=True,
+        medianprops={"color": "#1A1A1A", "linewidth": 2},
+        meanprops={
+            "marker": "D",
+            "markerfacecolor": "#2CA02C",
+            "markeredgecolor": "#1A1A1A",
+            "markersize": 6,
+        },
+        whiskerprops={"color": "#4A4A4A", "linewidth": 1.2},
+        capprops={"color": "#4A4A4A", "linewidth": 1.2},
+        flierprops={
+            "marker": "o",
+            "markerfacecolor": "#D62728",
+            "markeredgecolor": "#D62728",
+            "alpha": 0.7,
+            "markersize": 5,
+        },
+    )
+
+    color_map = plt.get_cmap("tab10")
+
+    for index, box in enumerate(boxplot["boxes"]):
+        box.set_facecolor(color_map(index % color_map.N))
+        box.set_alpha(0.8)
+
+    use_log_scale = metric_name in LOG_SCALE_DISTRIBUTION_METRICS and all(
+        np.all(values > 0) for values in distribution_values
+    )
+
+    if use_log_scale:
+        axis.set_yscale("log")
+        axis.set_ylabel(f"{metric_name} (логарифмическая шкала)")
+    else:
+        axis.set_ylabel(metric_name)
+
+    axis.set_title(f"Распределение {metric_name} по тестовым интервалам")
+    axis.set_xlabel("Конфигурация модели")
+    axis.grid(axis="y", which="both", linestyle="--", linewidth=0.7, alpha=0.45)
+    axis.set_axisbelow(True)
+    axis.legend(
+        handles=[
+            Line2D([0], [0], color="#1A1A1A", linewidth=2, label="Медиана"),
+            Line2D(
+                [0],
+                [0],
+                marker="D",
+                color="none",
+                markerfacecolor="#2CA02C",
+                markeredgecolor="#1A1A1A",
+                markersize=6,
+                label="Среднее",
+            ),
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="none",
+                markerfacecolor="#D62728",
+                markeredgecolor="#D62728",
+                markersize=5,
+                label="Выброс",
+            ),
+        ],
+        loc="upper left",
+    )
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1081,11 +1200,12 @@ def run_experiments(
     LOGGER.info("Выполнено запусков для шагов проверки, моделей и наборов признаков: %s.", len(folds) * len(models) * len(feature_sets))
     predictions = pd.DataFrame(predictions_rows)
     metrics_by_fold = pd.DataFrame(metrics_rows)
-    metrics_summary = summarize_metrics(metrics_by_fold, get_enabled_metrics(config))
+    enabled_metrics = get_enabled_metrics(config)
+    metrics_summary = summarize_metrics(metrics_by_fold, enabled_metrics)
     save_results(predictions, metrics_by_fold, metrics_summary, config, result_paths)
 
     if config["saving"]["save_plots"]:
-        save_plots(predictions, metrics_summary, result_paths["plots"])
+        save_plots(predictions, metrics_by_fold, metrics_summary, enabled_metrics, result_paths["plots"])
 
     return predictions, metrics_by_fold, metrics_summary
 
@@ -1232,7 +1352,7 @@ def fit_model(
     seed: int,
     validation_split: float | None = None,
 ) -> keras.Model:
-    """Обучает модель с ранней остановкой и возвращает экземпляр Keras."""
+    """Обучает модель с ранней остановкой и возвращает обученную модель Keras."""
     set_random_seed(seed)
     keras.backend.clear_session()
     model = build_model(model_name, tuple(x_train.shape[1:]), config)
@@ -1330,7 +1450,7 @@ def iter_sliding_windows(
 
 
 def summarize_metrics(metrics_by_fold: pd.DataFrame, metric_names: list[str] | None = None) -> pd.DataFrame:
-    """Агрегирует mean, std и median по шагам проверки для каждой пары модель + набор признаков."""
+    """Рассчитывает среднее значение, стандартное отклонение и медиану по шагам проверки для каждой пары модели и набора признаков."""
     if metrics_by_fold.empty:
         raise ValueError("Нет метрик для построения итоговой сводки.")
 
@@ -1358,7 +1478,7 @@ def save_results(
     config: dict[str, Any],
     result_paths: dict[str, Path],
 ) -> None:
-    """Сохраняет прогнозы и метрики в CSV-файлы."""
+    """Сохраняет прогнозы и метрики в файлы CSV."""
     if config["saving"]["save_predictions"]:
         path = result_paths["predictions"] / "all_predictions.csv"
         predictions.to_csv(path, index=False)
@@ -1408,7 +1528,7 @@ def train_final_model(
     model_name: str,
     feature_set: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Обучает итоговую модель на всем диапазоне кроме последнего тестового окна и сохраняет артефакты."""
+    """Обучает итоговую модель на всем диапазоне, кроме последнего проверочного интервала, и сохраняет результаты."""
     result_paths = create_result_dirs(config, project_root)
     data = add_log_features(daily_df, config)
     feature_columns = get_feature_columns(data, feature_set)
@@ -1535,7 +1655,7 @@ def train_final_model(
 
 
 def build_empty_final_predictions() -> pd.DataFrame:
-    """Создает пустую таблицу итоговых прогнозов с ожидаемыми колонками."""
+    """Создает пустую таблицу итоговых прогнозов с ожидаемыми столбцами."""
     return pd.DataFrame(
         columns=[
             "model_name",
@@ -1558,7 +1678,7 @@ def save_final_artifacts(
     config: dict[str, Any],
     results_dir: Path,
 ) -> None:
-    """Сохраняет итоговые прогнозы, метрики, график и модельные артефакты."""
+    """Сохраняет итоговые прогнозы, метрики, график и файлы обученной модели."""
     results_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = results_dir / "final_predictions.csv"
     metrics_path = results_dir / "final_metrics.csv"
@@ -1606,7 +1726,7 @@ def format_date(value: Any) -> str:
 
 
 def create_result_dirs(config: dict[str, Any], project_root: Path) -> dict[str, Path]:
-    """Создает директории для результатов эксперимента."""
+    """Создает каталоги для результатов эксперимента."""
     base = resolve_path(config["paths"]["results_dir"], project_root)
     result_paths = {
         "base": base,
@@ -1672,7 +1792,7 @@ CONFIG_FILE = globals().get("CONFIG_FILE", "config.json")
 
 
 def main(config_file: str | Path = CONFIG_FILE) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Запускает полный пайплайн подготовки данных, rolling validation и итогового обучения."""
+    """Выполняет подготовку данных, скользящую проверку и обучение итоговой модели."""
     project_root = Path.cwd().resolve()
     config_path = project_root / config_file
 
