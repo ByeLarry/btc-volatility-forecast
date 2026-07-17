@@ -16,9 +16,7 @@
     "scaler": "standard",
     "epsilon": 1e-8,
     "random_seed": 764,
-    "metrics": ["mae", "rmse", "mape"],
-    "selection_metric": "rmse",
-    "train_final_model": false
+    "metrics": ["MAE", "RMSE", "MAPE"]
   },
   "training": {
     "loss": "mse",
@@ -43,7 +41,6 @@
     "activation": "relu"
   },
   "saving": {
-    "save_models": false,
     "save_predictions": true,
     "save_metrics": true,
     "save_plots": true
